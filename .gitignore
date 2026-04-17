@@ -1,0 +1,8 @@
+myenv/
+old files/
+qdarchive_storage2/
+qdarchive_storage/
+src/files/
+
+*csv
+*.log
