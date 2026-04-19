@@ -3,6 +3,10 @@ old files/
 qdarchive_storage2/
 qdarchive_storage/
 src/files/
+src/files2/
+src/files5/
 
 *csv
 *.log
+*.zip
+*.pdf
