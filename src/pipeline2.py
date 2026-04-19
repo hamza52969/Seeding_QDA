@@ -521,7 +521,7 @@ class HarvardDataversePipeline:
     # We do NOT call /api/datasets/:persistentId/ per dataset — that was causing
     # 401 errors on federated results and doubled the request count.
 
-    def _extract_license_from_item(self, item: dict, base_url: str) -> str:
+    def _extract_license_from_item(self, item: dict) -> str:
         """
         Pull licence from a Harvard Dataverse search result item.
 
@@ -546,7 +546,7 @@ class HarvardDataversePipeline:
         # 2. Version endpoint — license lives at data["data"]["license"]["name"]
         if doi:
             ver = get_json(
-                f"{base_url}/api/datasets/:persistentId/versions/:latest",
+                f"{HARVARD_BASE}/api/datasets/:persistentId/versions/:latest",
                 params={"persistentId": doi, "excludeFiles": "true"},
             )
             if ver:
@@ -569,7 +569,7 @@ class HarvardDataversePipeline:
         # 3. Full dataset endpoint
         if doi:
             ds = get_json(
-                f"{base_url}/api/datasets/:persistentId/",
+                f"{HARVARD_BASE}/api/datasets/:persistentId/",
                 params={"persistentId": doi},
             )
             if ds and ds.get("status") == "OK":
@@ -649,8 +649,7 @@ class HarvardDataversePipeline:
                   #  skipped_license += 1
                    #continue
 #
-                target_base = resolve_dataverse_base(doi)
-                raw_license = self._extract_license_from_item(item, target_base)
+                raw_license = self._extract_license_from_item(item)
 
                 if not is_open_license(raw_license):
                     # Log first 5 skipped licenses at INFO so we can see what's returned
@@ -753,6 +752,176 @@ class HarvardDataversePipeline:
         log.info("[Harvard] Starting QDA file-extension search pass...")
         qda_queries = HARVARD_QDA_FILE_QUERIES[:1] if test_mode else HARVARD_QDA_FILE_QUERIES
 
+        # In HarvardDataversePipeline.run()
+
+        for ext_query in qda_queries:
+            log.info(f"[Harvard] QDA file search: '{ext_query}'")
+            # Call the API WITHOUT subtree=harvard
+            data = get_json(f"{HARVARD_BASE}/api/search", params={
+                "q":        ext_query,
+                "type":     "file",
+                "per_page": 100,
+            })
+            
+            items = data.get("data", {}).get("items", [])
+            for item in items:
+                filename = item.get("name", "")
+                file_id = item.get("file_id")
+                doi = item.get("dataset_persistent_id")
+                
+                # Check if it's a target extension
+                if any(filename.lower().endswith(ext) for ext in QDA_EXTENSIONS):
+                    log.info(f"    Found QDA File: {filename} (ID: {file_id})")
+                    
+                    # Construct the direct download URL
+                    dl_url = f"{HARVARD_BASE}/api/access/datafile/{file_id}"
+                    doi_slug = safe_folder_name(doi.replace("doi:", ""))
+                    dest = FILES_DIR / HARVARD_FOLDER / doi_slug / filename
+                    
+                    if download_file(dl_url, dest):
+                        log.info(f"    ★ Successfully downloaded harvested file: {filename}")
+                # Log to DB as a project and file...
+
+                if project_exists(conn, HARVARD_REPOID, project_url):
+                    log.debug(f"  Already in DB: {doi}")
+                    continue
+
+                # Fetch full metadata to get title, description, authors, keywords
+                ds_meta = self.get_dataset_meta(doi)
+                if not ds_meta:
+                    log.warning(f"  Could not fetch metadata for {doi}")
+                    continue
+
+                raw_license = self._extract_license_from_item(ds_meta)
+                if not is_open_license(raw_license):
+                    log.debug(f"  Skipping non-open license '{raw_license}' for {doi}")
+                    skipped_license += 1
+                    continue
+
+                fields  = self._fields(ds_meta)
+                latest  = ds_meta.get("latestVersion", {})
+                title_v = fields.get("title", "")
+                title   = (title_v if isinstance(title_v, str) else "") or doi
+
+                desc_list = fields.get("dsDescription", []) or []
+                desc = ""
+                if isinstance(desc_list, list) and desc_list:
+                    first = desc_list[0]
+                    if isinstance(first, dict):
+                        dv = first.get("dsDescriptionValue", {})
+                        desc = dv.get("value", "") if isinstance(dv, dict) else str(dv)
+
+                lang_list   = fields.get("language", []) or []
+                language    = lang_list[0] if isinstance(lang_list, list) and lang_list else ""
+                upload_date = fields.get("productionDate", "")
+                version_str = str(latest.get("versionNumber", "")) or None
+
+                proj_data = dict(
+                    query_string               = f"file:{ext_query}",
+                    repository_id              = HARVARD_REPOID,
+                    repository_url             = HARVARD_REPOURL,
+                    project_url                = project_url,
+                    version                    = version_str,
+                    title                      = title[:500],
+                    description                = desc[:4000],
+                    language                   = language,
+                    doi                        = doi_url,
+                    upload_date                = str(upload_date) if upload_date else None,
+                    download_date              = now_ts(),
+                    download_repository_folder = HARVARD_FOLDER,
+                    download_project_folder    = doi_slug,
+                    download_version_folder    = version_str,
+                    download_method            = "API-CALL",
+                )
+
+                proj_id = insert_project(conn, proj_data)
+                insert_license(conn, proj_id, raw_license)
+                insert_keywords(conn, proj_id, self._extract_keywords_from_item(
+                    {"keywords": [], "subjects": fields.get("subject", [])}))
+                insert_persons(conn, proj_id, self._extract_authors_from_item(
+                    {"authors": []}))
+                log.info(f"  [DB id={proj_id}] QDA dataset: {title[:60]}")
+
+                if dry_run:
+                    processed += 1
+                    continue
+
+                # ── QDA file-level search pass ──────────────────────────────────────────
+        log.info("[Harvard] Starting QDA file-extension search pass...")
+        qda_queries = HARVARD_QDA_FILE_QUERIES[:1] if test_mode else HARVARD_QDA_FILE_QUERIES
+
+        for ext_query in qda_queries:
+            log.info(f"[Harvard] QDA file search: '{ext_query}'")
+            parent_dois = self.search_files(ext_query)
+            
+            for doi in parent_dois:
+                if doi in seen_dois:
+                    continue
+                seen_dois.add(doi)
+
+                # --- SMART ROUTING: Find the actual host of the file ---
+                target_base = resolve_dataverse_base(doi)
+                log.info(f"  Routing {doi} to {target_base}")
+
+                # 1. Fetch metadata directly from the source repository
+                ds_meta_response = get_json(f"{target_base}/api/datasets/:persistentId/", params={"persistentId": doi})
+                if not ds_meta_response or ds_meta_response.get("status") != "OK":
+                    log.warning(f"  Failed to fetch metadata from {target_base}")
+                    continue
+                
+                ds_meta = ds_meta_response.get("data", {})
+
+                # 2. Check License
+                raw_license = self._extract_license_from_item(ds_meta)
+                if not is_open_license(raw_license):
+                    log.debug(f"  Skipping non-open license '{raw_license}' for {doi}")
+                    skipped_license += 1
+                    continue
+
+                # 3. Save to DB
+                fields = self._fields(ds_meta)
+                title = fields.get("title", doi)
+                doi_slug = safe_folder_name(doi.replace("doi:", ""))
+                doi_url = self._extract_doi_url(doi)
+
+                proj_id = insert_project(conn, {
+                    "query_string": f"file:{ext_query}",
+                    "repository_id": HARVARD_REPOID,
+                    "repository_url": target_base, # Save the real source URL
+                    "project_url": doi_url,
+                    "title": str(title)[:500],
+                    "download_date": now_ts(),
+                    "download_repository_folder": HARVARD_FOLDER,
+                    "download_project_folder": doi_slug,
+                    "download_method": "API-CALL"
+                })
+                log.info(f"  [DB id={proj_id}] QDA dataset: {str(title)[:60]}")
+
+                # 4. Fetch the REAL file list from the source repository
+                file_list_response = get_json(f"{target_base}/api/datasets/:persistentId/versions/:latest/files", params={"persistentId": doi})
+                file_list = file_list_response.get("data", []) if file_list_response else []
+                
+                dest_base = FILES_DIR / HARVARD_FOLDER / doi_slug
+                
+                for fmeta in file_list:
+                    df = fmeta.get("dataFile", {})
+                    filename = df.get("filename", "")
+                    real_file_id = df.get("id")
+                    
+                    # Ensure it has an ID and matches our QDA extensions
+                    if not real_file_id or Path(filename).suffix.lower() not in QDA_EXTENSIONS:
+                        continue
+
+                    # Download from the source repository instead of Harvard
+                    dl_url = f"{target_base}/api/access/datafile/{real_file_id}?format=original"
+                    
+                    if download_file(dl_url, dest_base / filename):
+                        insert_file(conn, proj_id, filename)
+                        log.info(f"    ★ Successfully downloaded QDA file: {filename}")
+                    else:
+                        log.warning(f"    ✗ Failed to download: {filename}")
+
+                processed += 1
 
         log.info(
             f"[Harvard] Done. processed={processed}, "
